@@ -1257,7 +1257,7 @@ class Validator:
                 bt.logging.info(
                     "KeyboardInterrupt caught, gracefully closing the wandb run..."
                 )
-                if self.wandb_run:
+                if hasattr(self, 'wandb_run'):
                     self.wandb_run.finish()
                 exit()
 
