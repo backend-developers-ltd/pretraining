@@ -1,7 +1,7 @@
-bittensor==6.9.4
+bittensor
 huggingface_hub
 matplotlib
-pydantic==1.10
+pydantic
 python-dotenv
 rich
 safetensors
@@ -12,3 +12,4 @@ wandb
 datasets
 flash-attn
 taoverse==1.0.5
+compute-horde

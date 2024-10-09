@@ -22,10 +22,16 @@ from huggingface_hub.utils import disable_progress_bars
 disable_progress_bars()
 
 import asyncio
+from compute_horde.executor_class import ExecutorClass
+import uuid
+from compute_horde.miner_client.organic import (
+    OrganicJobDetails,
+    OrganicMinerClient,
+    run_organic_job,
+)
 import copy
 import dataclasses
 import datetime as dt
-import functools
 import json
 import math
 import os
@@ -38,6 +44,7 @@ from collections import defaultdict
 
 import bittensor as bt
 import torch
+import numpy as np
 import wandb
 
 from huggingface_hub.utils import RepositoryNotFoundError
@@ -53,17 +60,15 @@ from taoverse.model.competition.data import Competition
 from taoverse.model.competition.epsilon import EpsilonFunc, FixedEpsilon
 from taoverse.model.data import EvalResult
 from taoverse.model.model_tracker import ModelTracker
-from taoverse.model.model_updater import MinerMisconfiguredError, ModelUpdater
+from taoverse.model.model_updater import MinerMisconfiguredError
+from neurons.metadata_updater import MetadataUpdater
 from taoverse.model.storage.chain.chain_model_metadata_store import (
     ChainModelMetadataStore,
-)
-from taoverse.model.storage.disk.disk_model_store import DiskModelStore
-from taoverse.model.storage.hugging_face.hugging_face_model_store import (
-    HuggingFaceModelStore,
 )
 from taoverse.utilities import utils
 from taoverse.utilities.perf_monitor import PerfMonitor
 
+import base64
 import constants
 import pretrain as pt
 from competitions.data import CompetitionId
@@ -71,6 +76,17 @@ from model.retry import should_retry_model
 from neurons import config
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
+@dataclasses.dataclass
+class TrustedMiner:
+    address: str
+    port: int
+
+
+# Function to pickle an object and convert to base64 string
+def pickle_object_to_string(obj):
+    return base64.b64encode(pickle.dumps(obj)).decode("utf-8")
 
 
 @dataclasses.dataclass
@@ -112,6 +128,7 @@ class Validator:
     def __init__(self):
         self.config = config.validator_config()
         bt.logging(config=self.config)
+        bt.logging.__debug_on__ = True
 
         bt.logging.info(f"Starting validator with config: {self.config}")
 
@@ -143,8 +160,6 @@ class Validator:
             netuids=[self.config.netuid],
         )
 
-        torch.backends.cudnn.benchmark = True
-
         # Dont check registration status if offline.
         if not self.config.offline:
             self.uid = metagraph_utils.assert_registered(self.wallet, self.metagraph)
@@ -157,7 +172,7 @@ class Validator:
             self._new_wandb_run()
 
         # === Running args ===
-        self.weights = torch.zeros_like(torch.tensor(self.metagraph.S))
+        self.weights = torch.zeros_like(torch.tensor(torch.tensor(self.metagraph.S)))
         self.global_step = 0
         self.last_epoch = self.metagraph.block.item()
         self.last_wandb_step = 0
@@ -268,17 +283,9 @@ class Validator:
             wallet=self.wallet,
         )
 
-        # Setup a RemoteModelStore
-        self.remote_store = HuggingFaceModelStore()
-
-        # Setup a LocalModelStore
-        self.local_store = DiskModelStore(base_dir=self.config.model_dir)
-
-        # Setup a model updater to download models as needed to match the latest provided miner metadata.
-        self.model_updater = ModelUpdater(
+        # Setup a metadata updater to keep track of models to match the latest provided miner metadata.
+        self.metadata_updater = MetadataUpdater(
             metadata_store=self.metadata_store,
-            remote_store=self.remote_store,
-            local_store=self.local_store,
             model_tracker=self.model_tracker,
         )
 
@@ -449,10 +456,10 @@ class Validator:
                                 f"Force downloading model for UID {next_uid} because it should be retried. Eval_history={eval_history}"
                             )
 
-                # Compare metadata and tracker, syncing new model from remote store to local if necessary.
+                # Compare metadata and tracker, syncing new metadata from remote store to local if necessary.
                 try:
                     updated = asyncio.run(
-                        self.model_updater.sync_model(
+                        self.metadata_updater.sync_metadata(
                             hotkey=hotkey,
                             curr_block=curr_block,
                             schedule_by_block=constants.COMPETITION_SCHEDULE_BY_BLOCK,
@@ -511,9 +518,10 @@ class Validator:
             )
             time.sleep(300)
             # Check to see if the pending uids have been cleared yet.
-            pending_uid_count, current_uid_count = (
-                self.get_pending_and_current_uid_counts()
-            )
+            (
+                pending_uid_count,
+                current_uid_count,
+            ) = self.get_pending_and_current_uid_counts()
 
     def _queue_top_models_for_eval(self) -> None:
         # Take a deep copy of the metagraph for use in the top uid retry check.
@@ -553,7 +561,7 @@ class Validator:
                     # This still respects the eval block delay so that previously top uids can't bypass it.
                     try:
                         should_retry = asyncio.run(
-                            self.model_updater.sync_model(
+                            self.metadata_updater.sync_metadata(
                                 hotkey=hotkey,
                                 curr_block=curr_block,
                                 schedule_by_block=constants.COMPETITION_SCHEDULE_BY_BLOCK,
@@ -645,11 +653,6 @@ class Validator:
                     for hotkey, model_id in hotkey_to_model_id.items()
                     if hotkey in hotkeys_to_keep
                 }
-
-                self.local_store.delete_unreferenced_models(
-                    valid_models_by_hotkey=evaluated_hotkeys_to_model_id,
-                    grace_period_seconds=300,
-                )
             except Exception as e:
                 bt.logging.error(f"Error in clean loop: {e}")
 
@@ -753,11 +756,11 @@ class Validator:
 
         # Get the competition schedule for the current block.
         # This is a list of competitions
-        competition_schedule: typing.List[Competition] = (
-            competition_utils.get_competition_schedule_for_block(
-                block=cur_block,
-                schedule_by_block=constants.COMPETITION_SCHEDULE_BY_BLOCK,
-            )
+        competition_schedule: typing.List[
+            Competition
+        ] = competition_utils.get_competition_schedule_for_block(
+            block=cur_block,
+            schedule_by_block=constants.COMPETITION_SCHEDULE_BY_BLOCK,
         )
 
         # Every validator step should pick a single competition in a round-robin fashion
@@ -777,9 +780,10 @@ class Validator:
         if not uids:
             bt.logging.debug(f"No uids to eval for competition {competition.id}.")
             # Check if no competitions have uids, if so wait 5 minutes to download.
-            pending_uid_count, current_uid_count = (
-                self.get_pending_and_current_uid_counts()
-            )
+            (
+                pending_uid_count,
+                current_uid_count,
+            ) = self.get_pending_and_current_uid_counts()
             if pending_uid_count + current_uid_count == 0:
                 bt.logging.debug(
                     "No uids to eval for any competition. Waiting 5 minutes to download models."
@@ -791,22 +795,13 @@ class Validator:
 
         bt.logging.trace(f"Current block: {cur_block}")
 
-        # Get the dataloader for this competition
-        SubsetDataLoader = constants.DATASET_BY_COMPETITION_ID[competition.id]
-        bt.logging.trace(f"Dataset in use: {SubsetDataLoader.name}.")
-
-        # Get the tokenizer
-        tokenizer = pt.model.load_tokenizer(
-            competition.constraints, cache_dir=self.config.model_dir
-        )
-        
         if cur_block >= constants.sample_pack_block:
             pack_samples = True
             pages_per_eval = constants.pages_per_eval_pack
         else:
             pack_samples = False
             pages_per_eval = constants.pages_per_eval_unpack
-        
+
         # If the option is set in the config, override
         pages_per_eval = (
             self.config.pages_per_eval
@@ -814,38 +809,19 @@ class Validator:
             else pages_per_eval
         )
 
-        bt.logging.debug(f"Sample packing is set to: {pack_samples}.")
-        bt.logging.debug(f"Number of pages per evaluation step is: {pages_per_eval}")
-
-        dataloader = SubsetDataLoader(
-            batch_size=constants.batch_size,
-            sequence_length=competition.constraints.sequence_length,
-            num_pages=pages_per_eval,
-            tokenizer=tokenizer,
-            pack_samples=pack_samples,
-        )
-
-        batches = list(dataloader)
-        bt.logging.debug(f"Number of validation batches is {len(batches)}")
-        bt.logging.debug(f"Batch size is {len(batches[0])}")
-
-        # This is useful for logging to wandb
-        pages = dataloader.get_page_names()
-
         # Prepare evaluation.
         kwargs = competition.constraints.kwargs.copy()
         kwargs["use_cache"] = True
-
         bt.logging.debug(f"Competition {competition.id} | Computing losses on {uids}")
-        bt.logging.debug(f"Pages used are {pages}")
 
-        load_model_perf = PerfMonitor("Eval: Load model")
         compute_loss_perf = PerfMonitor("Eval: Compute loss")
 
-        for uid_i in uids:
-            # This variable should be overwritten below if the model has metadata.
-            losses: typing.List[float] = [math.inf for _ in range(len(batches))]
+        # Track uids to validate
+        uids_to_validate = []
+        hotkeys_to_validate = []
+        metadata_ids_to_validate = []
 
+        for uid_i in uids:
             bt.logging.trace(f"Getting metadata for uid: {uid_i}.")
 
             # Check that the model is in the tracker.
@@ -861,55 +837,103 @@ class Validator:
                 model_i_metadata is not None
                 and model_i_metadata.id.competition_id == competition.id
             ):
-                try:
-                    bt.logging.info(
-                        f"Evaluating uid: {uid_i} / hotkey: {hotkey} with metadata: {model_i_metadata} and hf_url: {model_utils.get_hf_url(model_i_metadata)}."
-                    )
+                uids_to_validate.append(uid_i)
+                hotkeys_to_validate.append(hotkey)
+                metadata_ids_to_validate.append(model_i_metadata.id.to_compressed_str())
 
-                    # Update the block this uid last updated their model.
-                    uid_to_state[uid_i].block = model_i_metadata.block
-                    # Update the hf repo for this model.
-                    uid_to_state[uid_i].repo_name = model_utils.get_hf_repo_name(
-                        model_i_metadata
-                    )
+                # Update the block this uid last updated their model.
+                uid_to_state[uid_i].block = model_i_metadata.block
+                # Update the hf repo for this model.
+                uid_to_state[uid_i].repo_name = model_utils.get_hf_repo_name(
+                    model_i_metadata
+                )
 
-                    # Get the model locally and evaluate its loss.
-                    model_i = None
-                    with load_model_perf.sample():
-                        model_i = self.local_store.retrieve_model(
-                            hotkey, model_i_metadata.id, kwargs
-                        )
+                bt.logging.info(
+                    f"Queueing for validation uid: {uid_i} / hotkey: {hotkey} with metadata: {model_i_metadata} and hf_url: {model_utils.get_hf_url(model_i_metadata)}."
+                )
 
-                    with compute_loss_perf.sample():
-                        # Run each computation in a subprocess so that the GPU is reset between each model.
-                        losses = utils.run_in_subprocess(
-                            functools.partial(
-                                pt.validation.compute_losses,
-                                model_i.pt_model,
-                                batches,
-                                self.config.device,
-                                tokenizer.eos_token_id,
-                                pack_samples,
-                            ),
-                            ttl=400,
-                            mode="spawn",
-                        )
-
-                    del model_i
-                except Exception as e:
-                    bt.logging.error(
-                        f"Error in eval loop: {e}. Setting losses for uid: {uid_i} to infinity."
-                    )
             else:
-                bt.logging.debug(
+                # Only using it to get avg loss so shape does not matter
+                uid_to_state[uid_i].losses = [math.inf]
+                bt.logging.error(
                     f"Unable to load the model for {uid_i} or it belongs to another competition. Setting loss to inifinity for this competition."
                 )
 
-            uid_to_state[uid_i].losses = losses
-            average_model_loss = sum(losses) / len(losses)
-            bt.logging.trace(
-                f"Computed model losses for uid:{uid_i} with average loss: {average_model_loss}"
+        bt.logging.debug(f"Will validate {len(uids_to_validate)} uids")
+
+        # TODO: replace this hack
+        trusted_miners = [
+            TrustedMiner(
+                address=constants.TRUSTED_MINER_ADDRESS,
+                port=constants.TRUSTED_MINER_PORT,
             )
+        ]
+
+        # round up how many uuids to validate per miner
+        N = (len(trusted_miners) + len(uids_to_validate) - 1) // len(trusted_miners)
+
+        for i, miner in enumerate(trusted_miners):
+
+            def select_chunk(arr):
+                return " ".join([str(x) for x in arr[N * i : N * (i + 1)]])
+
+            cmd_args = [
+                "--device",
+                self.config.device,
+                "--competition_pickle",
+                pickle_object_to_string(competition),
+                "--pages_per_eval",
+                pages_per_eval,
+                "--pack_samples",
+                pack_samples,
+                "--batch_size",
+                constants.batch_size,
+                "--hotkeys",
+                select_chunk(hotkeys_to_validate),
+                "--metadata_ids",
+                select_chunk(metadata_ids_to_validate),
+                "--uids",
+                select_chunk(uids_to_validate),
+            ]
+            bt.logging.error(
+                "------- COMMAND ARGS: " + " ".join([str(x) for x in cmd_args])
+            )
+
+            job_uuid = uuid.uuid4()
+            job_details = OrganicJobDetails(
+                job_uuid=str(job_uuid),
+                executor_class=ExecutorClass.always_on__llm__a6000,
+                docker_image=constants.VALIDATION_COMPUTE_HORDE_IMAGE,
+                docker_run_options_preset = "nvidia_all",
+                docker_run_cmd=cmd_args,
+                total_job_timeout=constants.VALIDATION_TOTAL_JOB_TIMEOUT,
+            )
+            miner_client = OrganicMinerClient(
+                miner_hotkey="5E5GRiFLWP7a5xdZVENFRHfRDYCktmBXE8hPY8AmnAa65itH",
+                miner_address=miner.address,
+                miner_port=miner.port,
+                job_uuid=str(job_uuid),
+                my_keypair=self.wallet.get_hotkey(),
+            )
+            bt.logging.debug(f"Created job details: {job_details} for miner: {miner}")
+
+            try:
+                stdout, stderr = await run_organic_job(
+                    miner_client,
+                    job_details,
+                    wait_timeout=constants.VALIDATION_WAIT_TIMEOUT,
+                )
+
+                if stderr and stderr != "":
+                    bt.logging.error(f"Computed losses with error: {stderr}")
+
+                losses = json.loads(stdout)
+                for uid_i, losses_i in losses.items():
+                    bt.logging.info(f"Computed losses for uid {uid_i}: {losses_i}")
+                    uid_to_state[uid_i].losses = losses_i
+            except Exception:
+                bt.logging.error("Failed to run organic job", exc_info=True)
+                continue
 
         # Compute wins and win rates per uid.
         # Take the average loss across all batches for comparison of best model.
@@ -937,7 +961,7 @@ class Validator:
 
         # Fill in metagraph sized tensor with the step weights of the evaluated models.
         with self.metagraph_lock:
-            competition_weights = torch.zeros_like(self.metagraph.S)
+            competition_weights = torch.zeros_like(torch.tensor(self.metagraph.S))
 
         for i, uid_i in enumerate(uids):
             competition_weights[uid_i] = step_weights[i]
@@ -984,8 +1008,22 @@ class Validator:
         self.save_state()
 
         # Log the performance of the eval loop.
-        bt.logging.debug(load_model_perf.summary_str())
         bt.logging.debug(compute_loss_perf.summary_str())
+
+        # This is useful for logging to wandb
+        # Get the tokenizer
+        tokenizer = pt.model.load_tokenizer(
+            competition.constraints, cache_dir=self.config.model_dir
+        )
+        SubsetDataLoader = constants.DATASET_BY_COMPETITION_ID[competition.id]
+        dataloader = SubsetDataLoader(
+            batch_size=constants.batch_size,
+            sequence_length=competition.constraints.sequence_length,
+            num_pages=pages_per_eval,
+            tokenizer=tokenizer,
+            pack_samples=pack_samples,
+        )
+        pages = dataloader.get_page_names()
 
         # Log to screen and wandb.
         self.log_step(
@@ -999,7 +1037,6 @@ class Validator:
             model_weights,
             wins,
             win_rate,
-            load_model_perf,
             compute_loss_perf,
         )
 
@@ -1072,7 +1109,6 @@ class Validator:
         model_weights: typing.List[float],
         wins: typing.Dict[int, int],
         win_rate: typing.Dict[int, float],
-        load_model_perf: PerfMonitor,
         compute_loss_perf: PerfMonitor,
     ):
         """Logs the results of the step to the console and wandb (if enabled)."""
@@ -1193,12 +1229,6 @@ class Validator:
                     for i, uid in enumerate(uids)
                 },
                 "competition_id": {str(uid): int(competition_id)},
-                "load_model_perf": {
-                    "min": load_model_perf.min(),
-                    "median": load_model_perf.median(),
-                    "max": load_model_perf.max(),
-                    "P90": load_model_perf.percentile(90),
-                },
                 "compute_model_perf": {
                     "min": compute_loss_perf.min(),
                     "median": compute_loss_perf.median(),
@@ -1257,7 +1287,7 @@ class Validator:
                 bt.logging.info(
                     "KeyboardInterrupt caught, gracefully closing the wandb run..."
                 )
-                if hasattr(self, 'wandb_run'):
+                if hasattr(self, "wandb_run"):
                     self.wandb_run.finish()
                 exit()
 

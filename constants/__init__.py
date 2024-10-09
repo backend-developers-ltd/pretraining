@@ -389,6 +389,18 @@ MAX_RUN_STEPS_PER_WANDB_RUN = 100
 
 weights_version_key = __spec_version__
 
+# compute horde
+VALIDATION_COMPUTE_HORDE_IMAGE = "backenddevelopersltd/pretrain-validation:v0-latest"
+# TRUSTED_MINER_ADDRESS="127.0.0.1"
+# TRUSTED_MINER_PORT=8000
+
+# TRUSTED_MINER_ADDRESS="38.80.122.116"
+TRUSTED_MINER_ADDRESS="38.128.233.216"
+TRUSTED_MINER_PORT=8000
+
+VALIDATION_TOTAL_JOB_TIMEOUT = 60*60*24
+VALIDATION_WAIT_TIMEOUT = 60*60*24
+
 # validator weight moving average term
 alpha = 0.5
 # validator scoring exponential temperature

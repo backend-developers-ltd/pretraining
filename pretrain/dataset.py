@@ -23,8 +23,6 @@ import numpy as np
 import bittensor as bt
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
-from datasets import load_dataset
-from pprint import pprint
 
 
 class SubsetLoader(IterableDataset):
