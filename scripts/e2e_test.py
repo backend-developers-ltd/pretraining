@@ -32,7 +32,7 @@ seed = 0
 
 model_dir = os.path.join(constants.ROOT_DIR, "model-store/")
 
-competition = constants.COMPETITION_SCHEDULE_BY_BLOCK[0][1][0]
+competition = constants.COMPETITION_SCHEDULE_BY_BLOCK[1][1][0]
 
 eval_tasks = []
 data_loaders = []
