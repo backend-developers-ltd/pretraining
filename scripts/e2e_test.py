@@ -5,6 +5,10 @@ import os
 import random
 import sys
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import bittensor
 from taoverse.model.model_tracker import ModelTracker
 from taoverse.model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
